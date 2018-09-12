@@ -1,0 +1,12 @@
+# Compiled Python
+*.pyc
+
+# Input files
+*.inp
+
+# Swap files
+*~
+
+# Outputs
+*.npy
+*.png
