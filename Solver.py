@@ -50,7 +50,7 @@ class Solver:
     """Provides functionality to solve the coupled phase-field problem
     """
             
-    def __init__(self, filename, Folder=None):
+    def __init__(self, filename, Folder=None, processes=None):
         """Constructor from input file. Calls Read_Mesh then Setup()
         
         Parameters
@@ -61,10 +61,19 @@ class Solver:
             Directory where to store outputs
         """
         
-        Nodes, Elements, Bound, NSet, ElSet = Read_Mesh(filename)
-        self.Setup(Nodes, Elements, Bound, NSet, ElSet, Folder)
+        # Parallelism and plotting have to work differently in iPython consoles
+        try:
+            get_ipython().__class__.__name__
+            self.ipython = True
+            self.Parallel = False
+        except:
+            self.Init_Parallel(processes)
+            self.ipython = False
         
-    def Setup(self, Nodes, Elements, Bound, NSet, ElSet, Folder=None):
+        Nodes, Elements, Steps, Amplitudes, NSet, ElSet = Read_Mesh(filename)
+        self.Setup(Nodes, Elements, Steps, Amplitudes, NSet, ElSet, Folder)
+        
+    def Setup(self, Nodes, Elements, Steps, Amplitudes, NSet, ElSet, Folder=None):
         """Constructor
         
         Parameters
@@ -73,8 +82,10 @@ class Solver:
             Coordinates of every node in the mesh
         Elements : list of Element objects
             All elements in the mesh
-        Bound : list of boundary lists
+        Steps : list of boundary information at each step
             Provides all boundary condition information
+        Amplitude : list of amplitude information
+            Provides amplitudes to be implemented in the steps
         NSet : dict
             All node sets
         ElSet : dict
@@ -90,14 +101,15 @@ class Solver:
         self.phidof = self.udof[self.dim::self.dim+1]
         self.udof = np.delete(self.udof,self.phidof)
         self.Elements = Elements
-        self.Bound = Bound
+        self.Steps = Steps
         self.NSet = NSet
+        self.Amplitudes = Amplitudes
         self.ElSet = ElSet
         
-        patches = []
+        self.patches = []
         for el in self.Elements:
-            patches.append(el.patch)
-        self.patch_collection = UpdatablePatchCollection(patches, cmap=cmap.jet)
+            self.patches.append(el.patch)
+        self.patch_collection = UpdatablePatchCollection(self.patches, cmap=cmap.jet)
         fig = plt.figure("Display", figsize=(10,10))
         fig.clf()
         ax = plt.gca()
@@ -105,28 +117,33 @@ class Solver:
         self.patch_collection.set_array(np.zeros(len(self.Elements)))
         self.cbar = fig.colorbar(self.patch_collection, ax=ax)
     
-        self.FixDof = []
-        self.Fixed_Inc = []
         dim = Nodes.shape[1]
-        for bc in Bound:
-            for dof in bc[1:-1]:
-                self.FixDof += [(dim+1)*x+dof for x in NSet[bc[0]]]
-                self.Fixed_Inc += [bc[-1] for x in NSet[bc[0]]]
-        self.FixDof = np.array(self.FixDof)
-        self.Fixed_Inc = np.array(self.Fixed_Inc)
-        self.FreeDof = np.arange(Nodes.shape[0]*(self.dim+1))
-        self.FreeDof = np.delete(self.FreeDof, self.FixDof)
+        for step in self.Steps:
+            step['FixDof'] = []
+            step['Fixed_Inc'] = []
+            step['AMP'] = 'DEFAULT'
+            for bc in step['INFO']:
+                for dof in bc['DOF']:
+                    step['FixDof'] += [(dim+1)*x+dof for x in NSet[bc['Set']]]
+                    step['Fixed_Inc'] += [bc['VAL'] for x in NSet[bc['Set']]]
+                    if step['AMP'] == 'DEFAULT':
+                        step['AMP'] = bc['AMP']
+            step['FixDof'] = np.array(step['FixDof'])
+            step['Fixed_Inc'] = np.array(step['Fixed_Inc'])
+            step['FreeDof'] = np.arange(Nodes.shape[0]*(self.dim+1))
+            step['FreeDof'] = np.delete(step['FreeDof'], step['FixDof'])
         
-        self.Fix_u = self.FixDof/(self.dim+1)*self.dim + (self.FixDof % (self.dim+1))
-        self.Free_u = np.delete(np.arange(self.udof.shape[0]), self.Fix_u)
-        self.Free_u_glob = self.udof[self.Free_u]
+            step['Fix_u'] = step['FixDof']/(self.dim+1)*self.dim + (step['FixDof'] % (self.dim+1))
+            step['Free_u'] = np.delete(np.arange(self.udof.shape[0]), step['Fix_u'])
+            step['Free_u_glob'] = self.udof[step['Free_u']]
         
         self.RHS = np.zeros(Nodes.shape[0]*(self.dim+1), dtype=float)
         self.uphi = self.RHS.copy()
         self.uphi_old = self.uphi.copy()
+        self.stage_end = self.uphi.copy()
         
         self.step = 0
-        self.iter_max = 1000
+        self.iter_max = 500
         self.t = 0.
         self.t_max = 1.
         self.dt = 2e-3
@@ -136,8 +153,14 @@ class Solver:
         self.ctol = 1e-2
         self.flux = {}
         
-        self.Parallel = False
         self.solves = 0
+        
+        # Save the mesh information for ease of use later
+        np.save(self.Folder + "\\Mesh.npy", {'Elements':self.Elements,
+                                             'Nodes':self.Nodes,
+                                             'Steps':self.Steps,
+                                             'ElSet':self.ElSet,
+                                             'NSet':self.NSet})
     
     def Resume(self, filename, step=0):
         """ Picks up where a previous solution left off
@@ -155,14 +178,23 @@ class Solver:
         self.uphi = data['uphi']
         self.RHS = data['RHS']
         self.t = data['time']
+        self.stage = data['stage']
+        self.stage_end = data['stage_end']
         self.step = step
+        
+        for el in self.Elements:
+            el.Update_Energy(self.uphi[el.dof])
         
     def Init_Parallel(self, processes=None):
         if processes is None:
             processes = mp.cpu_count()
-        print "Setting up %i processes to do parallel local assembly"%processes
-        self.pool = mp.Pool(processes)
-        self.Parallel = True
+            
+        if processes <= 1:
+            self.Parallel = False
+        else:
+            print "Setting up %i processes to do parallel local assembly"%processes
+            self.pool = mp.Pool(processes)
+            self.Parallel = True
         
     def Setup_Directory(self, Folder):
         """ Prepares output direcdtory for storing results
@@ -316,12 +348,17 @@ class Solver:
  
         np.save(self.Folder + "\\Step_%i.npy"%self.step, {'uphi':self.uphi,
                                                           'RHS':self.RHS,
-                                                          'time':self.t})
+                                                          'time':self.t,
+                                                          'stage':self.stage,
+                                                          'stage_end':self.stage_end})
         self.step += 1
         self.uphi_old = self.uphi.copy()
         self.RHS_old = self.RHS.copy()
         self.t += self.dt
-        self.uphi[self.FixDof] = self.t * self.Fixed_Inc
+        amplitude = self.Amplitudes[self.stage['AMP']]
+        self.uphi[self.stage['FixDof']] = (self.stage_end[self.stage['FixDof']] +
+                  np.interp(self.t, amplitude[:,0], amplitude[:,1]) *
+                  self.stage['Fixed_Inc'])
             
     def Reduce_Step(self, ratio=0.5):
         """Reduces the step size in the case of non-convergence
@@ -346,7 +383,10 @@ class Solver:
         
         self.uphi = self.uphi_old.copy()
         self.RHS = self.RHS_old.copy()
-        self.uphi[self.FixDof] = self.t * self.Fixed_Inc
+        amplitude = self.Amplitudes[self.stage['AMP']]
+        self.uphi[self.stage['FixDof']] = (self.stage_end[self.stage['FixDof']] +
+                  np.interp(self.t, amplitude[:,0], amplitude[:,1]) *
+                  self.stage['Fixed_Inc'])
         
     def Solve_Staggered(self):
         """Solve each subsystem in staggered fashion
@@ -361,6 +401,8 @@ class Solver:
         """
         
         uphi_p = self.uphi_old.copy()
+        Free_u = self.stage['Free_u']
+        Free_u_glob = self.stage['Free_u_glob']
         
         while self.dt > self.dt_min:
             accelerate = None
@@ -385,9 +427,9 @@ class Solver:
             
             for self.iter in range(self.iter_max):
                 Kuu = self.Global_Assembly('UU', Assemble=3, couple=False)
-                du = spla.spsolve(Kuu[self.Free_u[:,np.newaxis], self.Free_u],
-                                  -self.RHS[self.Free_u_glob])
-                self.uphi[self.Free_u_glob] += du
+                du = spla.spsolve(Kuu[Free_u[:,np.newaxis], Free_u],
+                                  -self.RHS[Free_u_glob])
+                self.uphi[Free_u_glob] += du
                 
                 if self.Convergence(du, 'UU'):
                     if self.iter < 5 and accelerate:
@@ -411,6 +453,8 @@ class Solver:
         
         uphi_u = self.uphi_old.copy()
         uphi_p = self.uphi_old.copy()
+        Free_u = self.stage['Free_u']
+        Free_u_glob = self.stage['Free_u_glob']
         
         p_conv = False
         u_conv = False
@@ -421,9 +465,9 @@ class Solver:
                 if not u_conv:
                     uphi_u[self.udof] = self.uphi[self.udof]
                     Kuu = self.Global_Assembly('UU', uphi=uphi_u, Assemble=3, couple=False)
-                    du = spla.spsolve(Kuu[self.Free_u[:,np.newaxis], self.Free_u],
-                                      -self.RHS[self.Free_u_glob])
-                    self.uphi[self.Free_u_glob] += du
+                    du = spla.spsolve(Kuu[Free_u[:,np.newaxis], Free_u],
+                                      -self.RHS[Free_u_glob])
+                    self.uphi[Free_u_glob] += du
                 
                 if not p_conv:
                     uphi_p[self.phidof] = self.uphi[self.phidof]
@@ -434,11 +478,9 @@ class Solver:
                 p_conv = self.Convergence(dp, 'PP')
                 u_conv = self.Convergence(du, 'UU')
                 if p_conv and u_conv:
-#                if np.linalg.norm(self.RHS[self.udof]) < self.tol and np.linalg.norm(self.RHS[self.phidof]) < self.tol:
-#                    print ("Phi dof converged within %6.5f and u dof converged "
-#                          "within %6.5f"%(phirat, urat))
                     if self.iter < 5:
-                        self.dt = min(2*self.dt, self.dt_max)
+                        pass
+#                        self.dt = min(2*self.dt, self.dt_max)
                     return
              
 #            if self.Plotting:
@@ -459,33 +501,26 @@ class Solver:
         None
         """
         
+        Free_u = self.stage['Free_u']
+        Free_u_glob = self.stage['Free_u_glob']
+        
         while self.dt > self.dt_min:
             for self.iter in range(self.iter_max):
 #                print "Step: ", i
                 self.solves += 1
                 Kuu = self.Global_Assembly('UU', uphi=self.uphi, Assemble=3, couple=False)
-                du = spla.spsolve(Kuu[self.Free_u[:,np.newaxis], self.Free_u],
-                                  -self.RHS[self.Free_u_glob])
-                self.uphi[self.Free_u_glob] += du
+                du = spla.spsolve(Kuu[Free_u[:,np.newaxis], Free_u],
+                                  -self.RHS[Free_u_glob])
+                self.uphi[Free_u_glob] += du
                 
                 Kpp = self.Global_Assembly('PP', uphi=self.uphi, Assemble=3, couple=True)
                 dp = spla.spsolve(Kpp, -self.RHS[self.phidof])
                 self.uphi[self.phidof] += dp
-
-#                print "Max change in damage %1.6g"%np.max(solver.uphi[self.phidof] - solver.uphi_old[self.phidof])
-#                self.plot()
-                if np.max(solver.uphi[self.phidof] - solver.uphi_old[self.phidof]) > 0.5 and solver.dt > 2e-4:
-                    self.Reduce_Step(ratio=0.1)
-                    break
                     
-                if (self.iter % 1) == 0:
-                    self.plot(data=['change'], suffix='_iter_%i'%self.iter)
                 p_conv = self.Convergence(dp, 'PP')
                 u_conv = self.Convergence(du, 'UU')
+                self.plot(data=['RHS','change'], save=True, suffix='_iter_%i'%self.iter)
                 if p_conv and u_conv:
-#                if np.linalg.norm(self.RHS[self.udof]) < self.tol and np.linalg.norm(self.RHS[self.phidof]) < self.tol:
-#                    print ("Phi dof converged within %6.5f and u dof converged "
-#                          "within %6.5f"%(phirat, urat))
                     if self.iter < 5:
                         pass
 #                        self.dt = min(2*self.dt, self.dt_max)
@@ -507,27 +542,24 @@ class Solver:
         None
         """
         
+        FreeDof = self.stage['FreeDof']
+        
         du = 0*self.RHS
         while self.dt > self.dt_min:
             for self.iter in range(self.iter_max):
 #                print "Step: ", i
                 K = self.Global_Assembly('ALL', uphi=self.uphi, Assemble=3, couple=True)
-                du[self.FreeDof] = spla.spsolve(K[self.FreeDof[:,np.newaxis], self.FreeDof],
-                                  -self.RHS[self.FreeDof])
-
-                du[self.phidof] = np.minimum(np.maximum(du[self.phidof], -self.uphi[self.phidof]), 1-self.uphi[self.phidof])
+                du[FreeDof] = spla.spsolve(K[FreeDof[:,np.newaxis], FreeDof],
+                                  -self.RHS[FreeDof])
                 self.uphi += du
-                                
-                if (self.iter % 5) == 0:
-                    self.plot(data=['change'], suffix='_iter_%i'%self.iter)
+                
                 p_conv = self.Convergence(du[self.phidof], 'PP')
-                u_conv = self.Convergence(du[self.Free_u_glob], 'UU')
+                u_conv = self.Convergence(du[self.stage['Free_u_glob']], 'UU')
+                self.plot(data=['uphi','RHS','change'], save=True, suffix='_iter_%i'%self.iter)
                 if p_conv and u_conv:
-#                if np.linalg.norm(self.RHS[self.udof]) < self.tol and np.linalg.norm(self.RHS[self.phidof]) < self.tol:
-#                    print ("Phi dof converged within %6.5f and u dof converged "
-#                          "within %6.5f"%(phirat, urat))
                     if self.iter < 5:
-                        self.dt = min(2*self.dt, self.dt_max)
+                        pass
+#                        self.dt = min(2*self.dt, self.dt_max)
                     return
              
 #            if self.Plotting:
@@ -535,8 +567,80 @@ class Solver:
             self.Reduce_Step()
             
         raise ValueError("Step size too small")
+
+    def Solve_Hybrid(self):
+        """Solve each subsystem in hybrid (modified Newton-Raphson) fashion
         
-    def Convergence(self, du, section):
+        Parameters
+        ----------
+        None
+        
+        Returns
+        -------
+        None
+        """
+        
+        Free_u = self.stage['Free_u']
+        Free_u_glob = self.stage['Free_u_glob']
+        du = np.zeros(self.Nodes.size)
+        
+        for i in range(10000):
+            p_conv = False
+            u_conv = False
+            uphi_u = self.uphi.copy()
+            uphi_p = self.uphi.copy()
+            for self.iter in range(self.iter_max):
+#                print "Step: ", i
+                if not u_conv:
+                    uphi_u[self.udof] = self.uphi[self.udof]
+                    Kuu = self.Global_Assembly('UU', uphi=uphi_u, Assemble=3, couple=False)
+                    du[Free_u] = spla.spsolve(Kuu[Free_u[:,np.newaxis], Free_u],
+                                      -self.RHS[Free_u_glob])
+                    self.uphi[Free_u_glob] += du[Free_u]
+                
+                if not p_conv:
+                    uphi_p[self.phidof] = self.uphi[self.phidof]
+                    Kpp = self.Global_Assembly('PP', uphi=uphi_p, Assemble=3, couple=False)
+                    dp = spla.spsolve(Kpp, -self.RHS[self.phidof])
+                    self.uphi[self.phidof] += dp
+
+                p_conv = self.Convergence(dp, 'PP', hold=(i>0))
+                u_conv = self.Convergence(du[Free_u], 'UU', hold=(i>0))
+                self.plot(data=['uphi', 'RHS', 'change'], save=True, suffix='_iter_%i-%i'%(i,self.iter))
+#                update = np.hstack([du.reshape(-1,2), dp.reshape(-1,1)])
+#                self.plot(data=[], save=True, suffix='_iter_%i-%i'%(i,self.iter), update=update)
+                if p_conv and u_conv:
+                    if self.iter < 5:
+                        pass
+#                        self.dt = min(2*self.dt, self.dt_max)
+                    break
+                
+            if i == 0:
+                last_change = self.uphi - self.uphi_old
+                for el in self.Elements:
+                    el.Update_Energy(self.uphi[el.dof])
+            else:
+                new_change = self.uphi - self.uphi_old
+                diff = new_change - last_change
+                urel = np.linalg.norm(diff[self.udof]) / np.linalg.norm(last_change[self.udof])
+                prel = np.linalg.norm(diff[self.phidof]) / np.linalg.norm(last_change[self.phidof])
+                uabs = np.linalg.norm(new_change[self.udof])
+                pabs = np.linalg.norm(new_change[self.phidof])
+                if (urel < 1e-6 or uabs < 1e-12) and (prel < 1e-6 or pabs < 1e-12):
+                    print "Converged after %i corrections"%i
+                    return
+                else:
+                    print "u_rel: %6.4g\tphi_rel: %6.4g\nphi_abs: %6.4g\tphi_abs: %6.4g"%(urel, prel, uabs, pabs)
+                    for el in self.Elements:
+                        el.Update_Energy(self.uphi[el.dof])
+                last_change = new_change
+            continue
+             
+            self.Reduce_Step()
+            
+        raise ValueError("Step size too small")
+
+    def Convergence(self, du, section, hold=False):
         """Check if nonlinear iterations have converged
         
         Parameters
@@ -545,6 +649,8 @@ class Solver:
             Change to field variables in last increment
         section : string
             Which subset of problem is being updated ('UU', 'PP', or 'ALL')
+        hold : boolean
+            Flag indicating that this is is a correction step and criteria are different
         
         Returns
         -------
@@ -553,23 +659,23 @@ class Solver:
         """
         
         if section == 'UU':
-            subset = self.Free_u_glob
+            subset = self.stage['Free_u_glob']
         elif section == 'PP':
             subset = self.phidof
         elif section == 'ALL':
-            subset = self.FreeDof
+            subset = self.stage['FreeDof']
         else:
             print "Section specified = %s"%section
             raise ValueError("Unknown section specified in convergence")
         assert du.size == subset.size
         
-        if self.iter == 0:
+        if not hold and self.iter == 0:
             self.flux[section] = np.sum(np.abs(self.RHS[subset]))
         else:
             self.flux[section] += np.sum(np.abs(self.RHS[subset]))
 #            self.flux[section] = max(np.sum(np.abs(self.RHS[subset])), self.flux[section])
             
-        if True:#self.flux[section] == 0:
+        if self.flux[section] == 0:
             force_check = True
         else:
             force_check = np.max(np.abs(self.RHS[subset])) < self.ftol * self.flux[section]/(self.iter+1)
@@ -577,7 +683,7 @@ class Solver:
         if np.max(np.abs(increment)) == 0:
             corr_check = True
         else:
-            corr_check = np.max(np.abs(du)) < self.ctol * np.max(np.abs(increment))
+            corr_check = np.max(np.abs(du)) < self.ctol * np.max(np.abs(increment)) or np.max(abs(du)) < 1e-12
 
         print "It: %i, Sect: %s, Force: %i, Corr: %i"%(self.iter, section, force_check, corr_check)
         return force_check and corr_check
@@ -604,42 +710,30 @@ class Solver:
             Solve = self.Solve_Coupled
         elif Method == 'Full':
             Solve = self.Solve_Full
+        elif Method == 'Hybrid':
+            Solve = self.Solve_Hybrid
         else:
             raise ValueError("Unknown solver method specified")
             
         self.plot()
         Disp = []
         Reaction = []
-        while self.t < self.t_max:
-            self.Increment()
-            Solve()
-            if solver.step >= 400:
-                solver.dt = 2e-4
-#            if solver.dt < 9e-3 and (solver.t % (10*solver.dt) < 1e-4*solver.dt or 10*solver.dt-(solver.t % (10*solver.dt)) < 1e-4*solver.dt):
-#                solver.dt *= 10
-#            if solver.t > 0.44-1e-8:
-#                solver.dt = 1e-3
-#                if solver.t > 0.444-1e-8:
-#                    solver.dt = 1e-4
-#                    if solver.t > 0.4449-1e-8:
-#                        solver.dt = 1e-5
-#                        
-#            if solver.t > 0.445-1e-8:
-#                solver.dt = 1e-4
-#                if solver.t > 0.445-1e-8:
-#                    solver.dt = 1e-3
-#                    if solver.t > 0.45-1e-8:
-#                        solver.dt = 1e-2
-            
-            Disp.append(self.uphi[1::3].max())
-            Reaction.append( np.linalg.norm(self.RHS[(self.dim+1)*np.array(self.NSet['TOP'])+1]) )
-            print "Time: ", self.t
-            if int(self.t / plot_frequency) > int((self.t - self.dt) / plot_frequency):
-                self.plot()
+        for self.stage in self.Steps:
+            while self.t < self.t_max:
+                self.Increment()
+    
+                
+                Disp.append( np.max(self.uphi[(self.dim+1)*np.array(self.NSet['TOP'])+1]) )
+                Reaction.append( np.linalg.norm(self.RHS[(self.dim+1)*np.array(self.NSet['TOP'])+1]) )
+                print "Time: ", self.t
+                if True or int(self.t / plot_frequency) > int((self.t - self.dt) / plot_frequency):
+                    self.plot()
+
+            self.stage_end = self.uphi.copy()
                 
         return Disp, Reaction
         
-    def plot(self, amp=1e0, data=['uphi'], save=True, suffix=''):
+    def plot(self, amp=1e0, data=['uphi'], save=True, suffix='', update=None):
         """Plot the current displacements and damage status
         
         Parameters
@@ -654,6 +748,9 @@ class Solver:
                 el_eng - elastic energy
                 el_ten_eng - elastic tensile energy
                 eng - energy
+        update : array_like, optional
+            Rows must match number of nodes.  If specified, will plot a heatmap
+            of variables in each column (intended to visualize how data is being updated)
         
         Returns
         -------
@@ -661,6 +758,12 @@ class Solver:
         """
         
         # Checking if any energies are to be plotted
+        if update is not None:
+            if update.shape[0] == self.Nodes.shape[0]:
+                data = ['update']
+            else:
+                print "Update vector has wrong shape, ignoring"
+                
         types = 0
         active = []
         energies = np.zeros((len(self.Elements),3))
@@ -707,11 +810,16 @@ class Solver:
                 vec = self.uphi - self.uphi_old
             elif datum == 'RHS':
                 vec = self.RHS
+            elif datum == 'update':
+                vec = 0*self.RHS
             else:
                 print "Unkown variable to plot %s"%datum
                 raise ValueError("Unkown plotting variable")
 
-            colors = np.zeros(len(self.Elements))
+            if datum == 'update':
+                colors = np.zeros((len(self.Elements),3))
+            else:
+                colors = np.zeros(len(self.Elements))
             shape = self.Nodes.copy()
             shape[:,0] += amp*vec[0::3]
             shape[:,1] += amp*vec[1::3]
@@ -747,34 +855,74 @@ class Solver:
 #                            [vec[el.dof[el.phidof]] for el in self.Elements]))
 #                    else:
                     colors[i] = np.mean(vec[el.dof[el.phidof]])
-                i += 1
+                    i += 1
+                elif datum == 'update':
+                    uphi = self.uphi.reshape(-1,3)
+                    colors[i,:] = np.mean(update[el.nodes,:], axis=0)/np.mean(uphi[el.nodes,:], axis=0)
+                    i += 1
+                    
+                    
+            
+            fig = plt.figure("Display", figsize=(10,10))
+            if self.ipython:
+                self.patch_collection = PatchCollection(self.patches, cmap=cmap.jet)
+                fig.clf()
+                ax = fig.gca()
+                ax.add_collection(self.patch_collection)
+                self.patch_collection.set_array(colors)
+                self.cbar = fig.colorbar(self.patch_collection, ax=ax)
+            else:
+                self.patch_collection.set_array(colors)
+                self.cbar.set_clim(colors.min(), colors.max())
+                self.cbar.draw_all()
                 
-            plt.figure("Display", figsize=(10,10))
-            self.patch_collection.set_array(colors)
-            self.cbar.set_clim(colors.min(), colors.max())
-            self.cbar.draw_all()
+            if datum == 'update':
+                break
+            
             plt.axis('equal')
             plt.xlim(minim[0], maxim[0])
             plt.ylim(minim[1], maxim[1])
             plt.title('%s_%f'%(datum, self.t))
-            plt.draw()
-            plt.pause(0.05)
             if save:
                 plt.savefig("%s\\%s_step_%i%s.png"%(self.Folder, datum, self.step, suffix))
-             
+            plt.draw()
+            plt.pause(0.05)
+        
+        if update is not None:
+            for i in range(update.shape[1]):
+                if self.ipython:
+                    self.patch_collection = PatchCollection(self.patches, cmap=cmap.jet)
+                    fig.clf()
+                    ax = fig.gca()
+                    ax.add_collection(self.patch_collection)
+                    self.patch_collection.set_array(colors[:,i])
+                    self.cbar = fig.colorbar(self.patch_collection, ax=ax)
+                else:
+                    self.patch_collection.set_array(colors[:,i])
+                    self.cbar.set_clim(colors[:,i].min(), colors[:,i].max())
+                    self.cbar.draw_all()
+                
+                plt.axis('equal')
+                plt.xlim(minim[0], maxim[0])
+                plt.ylim(minim[1], maxim[1])
+                plt.title('%s_%i_%f'%(datum, i, self.t))
+                if save:
+                    plt.savefig("%s\\%s_%i_step_%i%s.png"%(self.Folder, datum, i, self.step, suffix), dpi=200)
+                plt.draw()
+                plt.pause(0.05)
+                
+            
+            
         
 if __name__ == "__main__":
     
-    solver = Solver('Asymmetric.inp', getcwd() + '\\Asym_Coupled_SmallerStepFull2')
+    solver = Solver('Asymmetric_Coarse.inp', getcwd() + '\\DELETEME')
+#    solver = Solver('Double_Crack.inp', getcwd() + '\\Symmetric_Coupled_1e-4')
 #    solver = Solver('Simple_Test.inp')
-#    solver = Solver('Coarse_Double_Crack.inp', getcwd() + '\\Steps')
+#    solver = Solver('Coarse_Double_Crack.inp', getcwd() + '\\Coarse_Hybrid')
     
-    solver.Resume(getcwd() + '\\Asym_Coupled_SmallerStep\\Step_402.npy', step=402)
+    solver.Resume(getcwd() + '\\Asymmetric_Coarse2_Coupled_2e-3\\Step_395.npy', step=395)
     
-#    try:
-#        get_ipython().__class__.__name__
-#    except:
-#        solver.Init_Parallel()
     import time
     t0 = time.time()
     Disp, Reaction = solver.run(1e-10, 'Full')
