@@ -125,10 +125,12 @@ class Element:
         self.nodes = nodes
         self.eltype = eltype
         self.dim = coords.shape[1]
+        self.coords = coords
         self.dof = np.array([d+nodes*(self.dim+1) for d in range(self.dim+1)]).T.reshape(-1)
         self.udof = np.arange(self.dof.size)
         self.phidof = self.udof[self.dim::self.dim+1]
         self.udof = np.delete(self.udof,self.phidof)
+        self.Surface_Eng = 0
         if order is None:
             if eltype == 'L2' or eltype == 'T3':
                 self.order = 1
@@ -142,6 +144,29 @@ class Element:
         self.Set_Properties(Gc, lc, E, nu, lam, mu, k, aniso)
         self._Construct_Shape(coords)
         self.patch = Polygon(coords, True)
+        
+        # Caching for performance
+        self.uphi_old = np.zeros(self.dof.size)
+        self.Kpp = np.zeros((self.phidof.size, self.phidof.size))
+        self.Kuu = np.zeros((self.udof.size, self.udof.size))
+        self.Fp = np.zeros(self.phidof.size)
+        self.Fu = np.zeros(self.udof.size)
+        
+        self.Kpp1 = np.zeros((self.weights.size, self.phidof.size, self.phidof.size))
+        self.Kpp2 = np.zeros((self.weights.size, self.phidof.size, self.phidof.size))
+        for i in range(self.weights.size):
+            coeff = self.J[i]*self.weights[i]
+            self.Kpp1[i] = np.dot(self.Gc * self.lc * coeff * self.B_phi[:,:,i].T, self.B_phi[:,:,i])
+            self.Kpp1[i] += np.outer(self.Gc / self.lc * coeff * self.N[i,:], self.N[i,:])
+            self.Kpp2[i] = np.outer(2*(1-self.k) * coeff * self.N[i,:], self.N[i,:])
+        
+        self.Reset()
+        
+    def Reset(self):
+        """Resets an element so that full assembly must be done on next call
+        """
+        self.phi_old = 10
+        self.strain_energy = 1e-16
         
     def Set_Properties(self, Gc=500, lc=1, E=1000, nu=0.3, lam=None, mu=None,
                        k=1e-10, aniso=True):
@@ -224,11 +249,13 @@ class Element:
                 pnts = np.array([-np.sqrt(0.6), 0, np.sqrt(0.6)])
                 wgts = np.array([5./9, 8./9, 5./9])
                 
-            GP[:,0] = np.tile(pnts,2**(self.dim-1))
-            self.weights = np.tile(wgts, 2**(self.dim-1))
+            GP[:,0] = np.tile(pnts,self.order**(self.dim-1))
+            wgts = np.tile(wgts, self.order**(self.dim-1))
+            self.weights = wgts.copy()
             for i in range(1,self.dim):
-                GP[:,i] = GP[:,i-1].T.reshape(2,-1).T.reshape(-1)
-                self.weights *= self.weights.T.reshape(2,-1).T.reshape(-1)
+                GP[:,i] = GP[:,i-1].T.reshape(self.order,-1).T.reshape(-1)
+                wgts = wgts.T.reshape(self.order,-1).T.reshape(-1)
+                self.weights *= wgts
                 
         return GP
                 
@@ -392,7 +419,7 @@ class Element:
         
         J = np.zeros(nGP)
         dNdx = np.zeros((self.dim, dNdxi.shape[1], nGP))
-        B_u = np.zeros(((self.dim**2+self.dim)/2, coords.size, nGP))
+        B_u = np.zeros(((self.dim**2+self.dim)//2, coords.size, nGP))
             
         for i in range(nGP):
             Jac = np.dot(dNdxi[i,:,:].T, coords)
@@ -774,17 +801,41 @@ class Element:
             Inelastic energy
         """
         
-        energies = np.zeros((self.weights.size, (types&4)/4 + (types&2)/2 + (types&1)))
+        energies = np.zeros((self.weights.size, (types&4)//4 + (types&2)//2 + (types&1)))
         for i in range(self.weights.size):
             phi = np.dot(self.N[i,:], uphi[self.phidof])
             eps = np.dot(self.B_u[:,:,i], uphi[self.udof])
-            energies[i,:] = self.Get_Energy(eps, phi, types=7)
+            energies[i,:] = self.Get_Energy(eps, phi, types=types)
         
         if reduction is None:
             return energies
         else:
             return reduction(energies, axis=0)
 
+    def Total_Energy(self, uphi):
+        """ Gets the total energy (strain + surface) at each Gauss point
+        
+        Parameters
+        ----------
+        uphi : array_like
+            vector of displacements/damage for this element
+            
+        Returns
+        -------
+        energies : array_like
+            Total energy at each Gauss point
+        """
+        
+        energies = np.zeros(self.weights.size)
+        for i in range(self.weights.size):
+            phi = np.dot(self.N[i,:], uphi[self.phidof])
+            gradphi = np.dot(self.B_phi[:,:,i], uphi[self.phidof])
+            eps = np.dot(self.B_u[:,:,i], uphi[self.udof])
+            energies[i] = self.Get_Energy(eps, phi, types=4)
+            energies[i] += self.Gc/2*(phi**2/self.lc + self.lc*np.dot(gradphi,gradphi))
+            
+        return energies
+                
     def Stress(self, uphi, reduction=None):
         """ Returns stress at each Gauss point based on displacement/damage vector
         
@@ -806,7 +857,7 @@ class Element:
         for i in range(self.weights.size):
             phi = np.dot(self.N[i,:], uphi[self.phidof])
             eps = np.dot(self.B_u[:,:,i], uphi[self.udof])
-            stress[i,:] = el._Constitutive(eps, phi, energy=False, couple=False)[0]
+            stress[i,:] = self._Constitutive(eps, phi, energy=False, couple=False)[0]
             
         if reduction is None:
             return stress
@@ -839,12 +890,19 @@ class Element:
         """
         
         section = section.upper()
+        self.updated = False
         
         # Initialization        
         if section == 'ALL':
+            self.Surface_Eng = 0
             K = np.zeros((uphi.size,uphi.size))
             F = np.zeros(uphi.size)
         if section == 'UU':
+            if Assemble & 4 == 4:
+                return self.Kuu, self.Fu + np.dot(self.Kuu,
+                                          uphi[self.udof] - self.uphi_old[self.udof])
+#            else:
+#                Assemble = 3
             K = np.zeros((self.udof.size,self.udof.size))
             F = np.zeros(self.udof.size)
         elif section == 'UP':
@@ -854,6 +912,12 @@ class Element:
             K = np.zeros((self.phidof.size,self.udof.size))
             F = None
         elif section == 'PP':
+            if Assemble & 4 == 4:
+                return self.Kpp, self.Fp + np.dot(self.Kpp,
+                                          uphi[self.phidof] - self.uphi_old[self.phidof])
+#            else:
+#                Assemble = 3
+            self.Surface_Eng = 0
             K = np.zeros((self.phidof.size,self.phidof.size))
             F = np.zeros(self.phidof.size)
 
@@ -889,6 +953,7 @@ class Element:
                             * coeff)
                 if Assemble & 2 == 2:
                     gradphi = np.dot(self.B_phi[:,:,i], uphi[self.phidof])
+                    self.Surface_Eng += self.Gc/2 * (phi**2/self.lc + self.lc * np.inner(gradphi, gradphi)) * coeff
                     F[self.phidof] += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, gradphi) * coeff
                     F[self.phidof] += (self.Gc / self.lc + 2*(1-self.k)*energy) * self.N[i,:].T * phi * coeff
                     F[self.phidof] -= 2*(1-self.k)*energy * self.N[i,:].T * coeff
@@ -905,10 +970,6 @@ class Element:
                 
                 
             elif section == 'UU':
-#                if Assemble & 1 == 1:
-#                    K += np.dot(self.B_u[:,:,i].T, np.dot(D, self.B_u[:,:,i]))*coeff
-#                if Assemble & 2 == 2:
-#                    F += np.dot(self.B_u[:,:,i].T, stress)*coeff
                 self.Assemble_U(K, F, D, stress, i, coeff, Assemble)
             
             elif section == 'UP':
@@ -925,16 +986,24 @@ class Element:
                 else:
                     # Decoupled, ignore currrent approximated energy
                     energy = self.Hist[i]
-#                if Assemble & 1 == 1:
-#                    K += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, self.B_phi[:,:,i]) * coeff
-#                    K += (self.Gc / self.lc + 2*(1-self.k)*energy) * np.outer(self.N[i,:].T, self.N[i,:]) * coeff
-#                if Assemble & 2 == 2:
-#                    gradphi = np.dot(self.B_phi[:,:,i], uphi[self.phidof])
-#                    F += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, gradphi).reshape(-1) * coeff
-#                    F += (self.Gc / self.lc + 2*(1-self.k)*energy) * self.N[i,:].T * phi * coeff
-#                    F -= 2*(1-self.k)*energy * self.N[i,:].T * coeff
                 self.Assemble_P(K, F, uphi, phi, i, coeff, energy, Assemble)
 
+        if section == 'UU':
+            self.phi_old = np.sum((1-uphi[self.phidof])**2)
+            self.uphi_old[self.udof] = uphi[self.udof]
+            if Assemble & 1 == 1:
+                self.Kuu = K
+            if Assemble & 2 == 2:
+                self.Fu = F
+        elif section == 'PP':
+            self.strain_energy = np.dot(uphi[self.udof].T, np.dot(self.Kuu, uphi[self.udof]))
+            self.uphi_old[self.phidof] = uphi[self.phidof]
+            if Assemble & 1 == 1:
+                self.Kpp = K
+            if Assemble & 2 == 2:
+                self.Fp = F
+            
+        self.updated = True
         return K, F
     
     def Assemble_U(self, K, F, D, stress, i, coeff, Assemble=3):
@@ -944,15 +1013,22 @@ class Element:
             F += np.dot(self.B_u[:,:,i].T, stress)*coeff
             
     def Assemble_P(self, K, F, uphi, phi, i, coeff, energy, Assemble=3):
+        # Commented parts are clearer to understand, but less efficient computationally
         if Assemble & 1 == 1:
-            K += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, self.B_phi[:,:,i]) * coeff
-            K += (self.Gc / self.lc + 2*(1-self.k)*energy) * np.dot(self.N[i,None].T, self.N[i,None]) * coeff
+#            K += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, self.B_phi[:,:,i]) * coeff
+#            K += (self.Gc / self.lc + 2*(1-self.k)*energy) * np.outer(self.N[i,:], self.N[i,:]) * coeff
+            K += self.Kpp1[i] + energy*self.Kpp2[i]
+#            K += np.dot(self.Gc * self.lc * coeff * self.B_phi[:,:,i].T, self.B_phi[:,:,i])
+#            K += np.outer((self.Gc / self.lc + 2*(1-self.k)*energy) * coeff * self.N[i,:], self.N[i,:])
         if Assemble & 2 == 2:
             gradphi = np.dot(self.B_phi[:,:,i], uphi[self.phidof])
-            F += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, gradphi) * coeff
-            F += (self.Gc / self.lc + 2*(1-self.k)*energy) * self.N[i,:].T * phi * coeff
-            F -= 2*(1-self.k)*energy * self.N[i,:].T * coeff
-
+#            self.Surface_Eng += self.Gc/2 * (phi**2/self.lc + self.lc * np.inner(gradphi, gradphi)) * coeff
+#            F += self.Gc * self.lc * np.dot(self.B_phi[:,:,i].T, gradphi) * coeff
+#            F += (self.Gc / self.lc + 2*(1-self.k)*energy) * self.N[i,:].T * phi * coeff
+#            F -= 2*(1-self.k)*energy * self.N[i,:].T * coeff
+            F += np.dot(self.B_phi[:,:,i].T, self.Gc * self.lc * coeff * gradphi)
+            F += self.N[i,:].T * ((self.Gc / self.lc + 2*(1-self.k)*energy) * phi * coeff)
+            F -= self.N[i,:].T * (2*(1-self.k)*energy * coeff)
         
     def RHS_FD(self, uphi, section, delta=1e-8):
         """Calculates the right hand side using finite differences
@@ -992,7 +1068,7 @@ class Element:
                 coeff = self.J[i]*self.weights[i]
                 
                 phi = np.dot(self.N[i,:],uphi_del[self.phidof])
-                u = np.zeros((self.dim*uphi_del.size)/(self.dim+1))
+                u = np.zeros((self.dim*uphi_del.size)//(self.dim+1))
                 for j in range(self.dim):
                     u[j::self.dim] = np.dot(self.N[i,:],uphi_del[self.udof[j::self.dim]])
                     
@@ -1010,7 +1086,7 @@ class Element:
                 coeff = self.J[i]*self.weights[i]
                 
                 phi = np.dot(self.N[i,:],uphi_del[self.phidof])
-                u = np.zeros((self.dim*uphi_del.size)/(self.dim+1))
+                u = np.zeros((self.dim*uphi_del.size)//(self.dim+1))
                 for j in range(self.dim):
                     u[j::self.dim] = np.dot(self.N[i,:],uphi_del[self.udof[j::self.dim]])
                     
@@ -1110,7 +1186,7 @@ class Element:
                         coeff = self.J[i]*self.weights[i]
                         
                         phi = np.dot(self.N[i,:],uphi_del[self.phidof])
-                        u = np.zeros((self.dim*uphi_del.size)/(self.dim+1))
+                        u = np.zeros((self.dim*uphi_del.size)//(self.dim+1))
                         for j in range(self.dim):
                             u[j::self.dim] = np.dot(self.N[i,:],uphi_del[self.udof[j::self.dim]])
                             
